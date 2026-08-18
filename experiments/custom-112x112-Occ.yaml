@@ -1,0 +1,49 @@
+# Stage 2: Occlusion training (no mask branch)
+# Loads Stage 1 pretrained backbone, adds synthetic occlusion to training data.
+#
+# IMPORTANT: Update these before training:
+#   - DATASET.REC_PATH, NUM_CLASS, NUM_IMAGE
+#   - NETWORK.PRETRAINED: path to Stage 1 best model
+
+NETWORK:
+  PRETRAINED: 'output/Custom/.../backbone_epoch_039.pth.tar'  # <-- CHANGE THIS: pick an epoch from Stage 1's output dir
+  IMAGE_SIZE: [112, 112]
+
+DATASET:
+  REC_PATH: ''   # <-- CHANGE THIS
+  NUM_CLASS: 100000                              # <-- CHANGE THIS
+  TRAIN_DATASET: 'Custom'
+
+LOSS:
+  TYPE: 'CosFace'
+  WEIGHT_PRED: 10.0
+  SCALE: 64.0
+  MARGIN: 0.4
+  MARGIN_WARMUP_EPOCHS: 5
+
+TRAIN:
+  MODE: 'Occ'
+  MODEL: 'iResNet50_FPN'
+  LR: 0.01
+  LR_STEP: [15, 30]
+  LR_FACTOR: 0.1
+  END_EPOCH: 40
+  BATCH_SIZE: 64
+  OPTIMIZER: 'sgd'
+  MOMENTUM: 0.9
+  WD: 0.0005
+  PATTERN: 5
+  NUM_MASK: 226
+  WORKERS: 8
+  PRINT_FREQ: 100
+
+SAMPLE_RATE: 0.1
+FP16: True
+LR_SCHEDULER: 'cosine'
+NUM_IMAGE: 5000000         # <-- CHANGE THIS
+
+# Azure File Share upload
+USE_AZURE: True
+AZURE_REMOTE_DIR: "training-checkpoint/from"
+WARMUP_ITERS: 2000
+WARMUP_LR: 0.0

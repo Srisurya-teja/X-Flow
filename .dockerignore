@@ -1,0 +1,10 @@
+output/
+pretrained/
+temp/
+*.tar
+*.lmdb
+*.rec
+*.idx
+__pycache__
+*.pyc
+.git

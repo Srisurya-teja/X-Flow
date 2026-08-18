@@ -1,0 +1,52 @@
+# Stage 1: Clean baseline training with PartialFC
+# Train backbone on clean faces only (no occlusion, no mask branch)
+#
+# IMPORTANT: Update these before training:
+#   - DATASET.REC_PATH: path to your RecordIO dataset
+#   - DATASET.NUM_CLASS: number of identities in your dataset
+#   - NUM_IMAGE: total number of images
+#   - SAMPLE_RATE: set lower for more identities (0.1 for 1M classes)
+
+NETWORK:
+  PRETRAINED: ''
+  IMAGE_SIZE: [112, 112]
+
+DATASET:
+  REC_PATH: '/training'   # <-- CHANGE THIS
+  NUM_CLASS: 390570                             # <-- CHANGE THIS
+  TRAIN_DATASET: 'Custom'
+
+LOSS:
+  TYPE: 'CosFace'
+  WEIGHT_PRED: 1.0
+  SCALE: 64.0
+  MARGIN: 0.4
+  MARGIN_WARMUP_EPOCHS: 5
+
+TRAIN:
+  MODE: 'Clean'
+  MODEL: 'iResNet50_FPN'
+  LR: 0.3
+  LR_STEP: [15, 30]
+  LR_FACTOR: 0.1
+  END_EPOCH: 40
+  BATCH_SIZE: 512
+  OPTIMIZER: 'sgd'
+  MOMENTUM: 0.9
+  WD: 0.0005
+  PATTERN: 0
+  NUM_MASK: 226
+  WORKERS: 8
+  PRINT_FREQ: 100
+
+# PartialFC settings
+SAMPLE_RATE: 1        # Use 1.0 if < 50K classes, 0.1 for 100K+
+FP16: True                # Mixed precision for speed
+LR_SCHEDULER: 'cosine'
+NUM_IMAGE: 25342967      # <-- CHANGE THIS (total images in your dataset)
+
+# Azure File Share upload
+USE_AZURE: True
+AZURE_REMOTE_DIR: "training-checkpoint/x-flow"
+WARMUP_ITERS: 2000
+WARMUP_LR: 0.0

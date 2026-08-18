@@ -1,0 +1,27 @@
+version: "3.8"
+
+services:
+  from-train:
+    build: .
+    runtime: nvidia
+    shm_size: "32g"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    volumes:
+      - .:/workspace/FROM
+      - /path/to/your/dataset:/data/dataset        # <-- CHANGE THIS
+      - /path/to/occluders:/workspace/FROM/data/datasets/occluder  # <-- CHANGE THIS
+      - /home/shared_scripts:/home/shared_scripts  # Azure upload helpers (needed when USE_AZURE=True)
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NCCL_P2P_DISABLE=0
+      - NCCL_IB_DISABLE=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 3
+              capabilities: [gpu]
+    command: bash start_distributed.sh 1
