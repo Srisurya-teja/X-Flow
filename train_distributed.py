@@ -216,7 +216,9 @@ def train_one_epoch(train_loader, model, module_pfc, criterion_mask_pred,
         n_batches += 1
 
         if rank == 0:
-            pbar.set_postfix(loss=f'{l:.3f}', lr=f'{optimizer.param_groups[0]["lr"]:.2e}')
+            pbar.set_postfix(loss=f'{l:.3f}',
+                             lr_h=f'{optimizer.param_groups[-1]["lr"]:.2e}',
+                             lr_b=f'{optimizer.param_groups[0]["lr"]:.2e}')
 
         if iters % config.TRAIN.PRINT_FREQ == 0 and iters != 0 and rank == 0:
             num_freq = min(batch_idx + 1, config.TRAIN.PRINT_FREQ)
@@ -427,21 +429,28 @@ def main():
     criterion_mask_pred = nn.CrossEntropyLoss().cuda()
 
     # ================================ OPTIMIZER ================================
+    # Discriminative learning rates: a low LR for the (pretrained) backbone and a
+    # high LR for the freshly-initialized PartialFC head. Set BACKBONE_LR to 0 to
+    # use a single LR (config.TRAIN.LR) for both. param_groups[0]=backbone, [1]=head.
+    head_lr = config.TRAIN.LR
+    backbone_lr = config.TRAIN.get('BACKBONE_LR', 0) or head_lr
     opt_params = [
-        {'params': model.parameters()},
-        {'params': module_pfc.parameters()},
+        {'params': model.parameters(), 'lr': backbone_lr},
+        {'params': module_pfc.parameters(), 'lr': head_lr},
     ]
+    if rank == 0 and backbone_lr != head_lr:
+        logger.info(f'Discriminative LR -> backbone={backbone_lr}, head={head_lr}')
 
     if config.TRAIN.OPTIMIZER == 'sgd':
         optimizer = torch.optim.SGD(
             opt_params,
-            lr=config.TRAIN.LR,
+            lr=head_lr,
             momentum=config.TRAIN.MOMENTUM,
             weight_decay=config.TRAIN.WD)
     elif config.TRAIN.OPTIMIZER == 'adam':
-        optimizer = torch.optim.Adam(opt_params, lr=config.TRAIN.LR)
+        optimizer = torch.optim.Adam(opt_params, lr=head_lr)
     elif config.TRAIN.OPTIMIZER == 'adamw':
-        optimizer = torch.optim.AdamW(opt_params, lr=config.TRAIN.LR, weight_decay=config.TRAIN.WD)
+        optimizer = torch.optim.AdamW(opt_params, lr=head_lr, weight_decay=config.TRAIN.WD)
     else:
         raise ValueError(f'Unknown optimizer: {config.TRAIN.OPTIMIZER}')
 
@@ -628,7 +637,9 @@ def main():
 
         # --- Rank-0-only: metrics, eval backbone, logging, Azure uploads ---
         if rank == 0:
-            cur_lr = optimizer.param_groups[0]['lr']
+            lr_head = optimizer.param_groups[-1]['lr']
+            lr_bb = optimizer.param_groups[0]['lr']
+            cur_lr = lr_head
             epoch_time = time.time() - epoch_start
 
             # Estimated time remaining, from average epoch time so far.
@@ -638,7 +649,7 @@ def main():
 
             logger.info(
                 f'Epoch {epoch} done | avg_loss={avg_loss:.6f} '
-                f'cls={avg_cls:.4f} pred={avg_pred:.4f} | LR={cur_lr:.6f} | '
+                f'cls={avg_cls:.4f} pred={avg_pred:.4f} | LR head={lr_head:.6f} bb={lr_bb:.6f} | '
                 f'time={epoch_time:.1f}s | ETA={eta_h:.1f}h ({epochs_left} epochs left)')
 
             # Per-epoch metrics CSV (one row per epoch; appended, survives resume).

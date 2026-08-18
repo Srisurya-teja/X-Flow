@@ -27,6 +27,7 @@ TRAIN:
   MODE: 'Clean'
   MODEL: 'iResNet50_FPN'
   LR: 0.3
+  BACKBONE_LR: 0.001   # low LR for pretrained backbone; head uses LR above
   LR_STEP: [15, 30]
   LR_FACTOR: 0.1
   END_EPOCH: 40
