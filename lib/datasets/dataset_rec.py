@@ -31,7 +31,7 @@ class MXFaceDataset_Occ(Dataset):
         transform: torchvision transform to apply
     """
     def __init__(self, root_dir, mode='Clean', img_size=(112, 112), pattern=5,
-                 ratio=4, transform=None):
+                 ratio=3, transform=None):
         super().__init__()
         self.root_dir = root_dir
         self.mode = mode
@@ -93,7 +93,7 @@ class MXFaceDataset_Occ(Dataset):
         if occ is None:
             return img, 0, None
 
-        factor = random.choice(np.linspace(1, 5, 9, endpoint=True))
+        factor = random.choice(np.linspace(0.85, 1.15, 7, endpoint=True))
         img_occ, mask, _ = utils.occluded_image_ratio(img.copy(), occ, factor)
 
         mask_label = utils.cal_similarity_label(self.grids, mask)

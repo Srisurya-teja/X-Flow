@@ -34,6 +34,7 @@ config.LR_SCHEDULER = 'multistep'       # 'multistep' | 'polynomial'
 config.NUM_IMAGE = 0                    # total images (for polynomial LR schedule)
 config.WARMUP_ITERS = 0                 # linear LR-warmup steps (multistep path); 0 = off
 config.WARMUP_LR = 0.0                  # starting LR for the warmup ramp
+config.CHECKPOINT_UPLOAD_FREQ = 1       # upload big resumable shards every N epochs (still saved locally every epoch)
 
 # ----------------------------- Azure File Share upload (optional) ---
 config.USE_AZURE = False                                        # upload checkpoints + logs each epoch
@@ -62,6 +63,7 @@ config.TRAIN.BATCH_SIZE = 128
 
 config.TRAIN.PATTERN = 5                # grid size for mask quantization
 config.TRAIN.NUM_MASK = 226            # number of grid classes (derived from PATTERN)
+config.TRAIN.RATIO = 4                 # Occ/Mask occlusion mix: 1-in-RATIO images stay clean
 
 
 def _update_dict(k, v):

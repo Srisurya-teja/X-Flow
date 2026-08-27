@@ -16,6 +16,8 @@ import csv
 import math
 import logging
 import argparse
+import threading
+from datetime import timedelta
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
@@ -58,6 +60,13 @@ np.random.seed(0)
 
 logger = logging.getLogger(__name__)
 
+# Silence the Azure SDK's very verbose per-request HTTP logging (headers, URLs,
+# response status for every PUT/GET) so it doesn't drown the training logs.
+logging.getLogger("azure").setLevel(logging.WARNING)
+logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
+logging.getLogger("azure.storage").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description='FROM + PartialFC Distributed Training')
@@ -76,10 +85,12 @@ def parse_args():
     parser.add_argument('--debug', help='debug mode', default=0, type=int)
     parser.add_argument('--model', help='model name', type=str)
     parser.add_argument('--loss', help='margin loss type (ArcFace/CosFace/Combined)', type=str)
-    parser.add_argument('--ratio', help='ratio of masked images', default=4, type=int)
+    parser.add_argument('--ratio', help='ratio of masked images', default=5, type=int)
     parser.add_argument('--resume', help='checkpoint to resume from', type=str, default='')
     parser.add_argument('--save_occ_samples', help='save N occluded sample images before training', type=int, default=0)
     parser.add_argument('--max_steps', help='stop each epoch after N steps (0=full); for smoke tests', type=int, default=0)
+    parser.add_argument('--finetune_lr', help='on --resume, ignore the saved schedule and run a fresh '
+                        'cosine decay from this head LR -> 0 over the remaining epochs', type=float, default=0.0)
     args = parser.parse_args()
     return args
 
@@ -114,7 +125,9 @@ def setup_distributed():
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
 
-    dist.init_process_group(backend="nccl")
+    # Longer timeout: checkpoint saves + (background) uploads can make one rank
+    # lag the collective; the default 10 min is too tight for large checkpoints.
+    dist.init_process_group(backend="nccl", timeout=timedelta(minutes=30))
     torch.cuda.set_device(local_rank)
     return rank, local_rank, world_size
 
@@ -189,13 +202,16 @@ def train_one_epoch(train_loader, model, module_pfc, criterion_mask_pred,
 
         # Backward
         optimizer.zero_grad()
+        optimizer_stepped = True
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(
                 list(model.parameters()) + list(module_pfc.parameters()), max_norm=5)
+            scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
+            optimizer_stepped = scale_before <= scaler.get_scale()
         else:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
@@ -203,7 +219,7 @@ def train_one_epoch(train_loader, model, module_pfc, criterion_mask_pred,
             optimizer.step()
 
         # Per-step LR schedules (e.g. polynomial warmup) advance every batch.
-        if scheduler_per_step and lr_scheduler is not None:
+        if scheduler_per_step and lr_scheduler is not None and optimizer_stepped:
             lr_scheduler.step()
 
         l, lc, lp = loss.item(), loss_cls.item(), loss_pred.item()
@@ -309,6 +325,32 @@ def _azure_upload(local_path, remote_dir):
         logger.error(f'Azure upload failed for {local_path}: {e}')
 
 
+_upload_thread = None
+
+
+def _start_background_upload(files, remote_dir):
+    """Upload a list of files to Azure in a background thread, so slow network I/O
+    on rank 0 never blocks the training collectives (which would NCCL-timeout the
+    other ranks). Best-effort; refreshes the SAS token per file inside _azure_upload."""
+    global _upload_thread
+
+    def _work():
+        for f in files:
+            _azure_upload(f, remote_dir)
+
+    _upload_thread = threading.Thread(target=_work, daemon=True)
+    _upload_thread.start()
+
+
+def _join_background_upload():
+    """Wait for the previous epoch's background upload to finish (so we never
+    overwrite a checkpoint file while it's still being read for upload)."""
+    global _upload_thread
+    if _upload_thread is not None:
+        _upload_thread.join()
+        _upload_thread = None
+
+
 def _set_margin(margin_loss, loss_type, value):
     """Update the margin on the loss object in place (PartialFC holds the same ref)."""
     if loss_type == 'CosFace':
@@ -344,13 +386,16 @@ def main():
     os.makedirs(final_output_dir, exist_ok=True)
 
     # Azure File Share upload setup (rank 0 only)
-    use_azure = (rank == 0) and config.get('USE_AZURE', False)
+    # Enabled on EVERY rank so each can upload its own checkpoint shard (final_output_dir
+    # was broadcast to all ranks, so they agree on the remote path).
+    use_azure = config.get('USE_AZURE', False)
     azure_remote_dir = None
     if use_azure:
         azure_remote_dir = '{}/{}'.format(
             config.AZURE_REMOTE_DIR.rstrip('/'),
             os.path.basename(final_output_dir.rstrip('/')))
-        logger.info(f'Azure upload enabled -> {azure_remote_dir}')
+        if rank == 0:
+            logger.info(f'Azure upload enabled -> {azure_remote_dir}')
 
     # ================================ MODEL ================================
     model = {
@@ -378,7 +423,8 @@ def main():
             model_state = model.state_dict()
             
             # FROM branch prefixes — keep these random
-            skip_prefixes = ('fpn.', 'mask.', 'regress.', 'fc.')
+            skip_prefixes_stage_1 = ('fpn.', 'mask.', 'regress.', 'fc.')
+            skip_prefixes = ('fpn.', 'mask.', 'regress.')
             
             loaded_count = 0
             skipped_count = 0
@@ -396,12 +442,12 @@ def main():
             if rank == 0:
                 logger.info(f'Loaded {loaded_count} pretrained backbone params')
                 logger.info(f'Skipped {skipped_count} params (FROM branch or mismatched)')
-    else:
-        if rank == 0:
-            logger.info(f'No pretrained model found at {pretrained_path}')
         else:
             if rank == 0:
-                logger.info(f'No pretrained model found at {pretrained_path}')
+                logger.warning(f'Pretrained file not found: {pretrained_path}')
+    else:
+        if rank == 0:
+            logger.info(f'No pretrained model specified')
 
     model = model.cuda()
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
@@ -526,12 +572,14 @@ def main():
         if 'optimizer' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
 
-        # LR scheduler position — restores the warmup/decay step so the LR continues
-        # instead of restarting from step 0 (critical for the polynomial schedule).
-        if 'state_lr_scheduler' in checkpoint:
-            lr_scheduler.load_state_dict(checkpoint['state_lr_scheduler'])
-        elif rank == 0:
-            logger.info('WARNING: checkpoint has no LR scheduler state; schedule restarts.')
+        # LR scheduler position — restore it for a normal continuation. With
+        # --finetune_lr we deliberately DON'T restore it: a fresh decaying schedule
+        # is built below so the LR doesn't warm-restart off the stretched cosine.
+        if not args.finetune_lr:
+            if 'state_lr_scheduler' in checkpoint:
+                lr_scheduler.load_state_dict(checkpoint['state_lr_scheduler'])
+            elif rank == 0:
+                logger.info('WARNING: checkpoint has no LR scheduler state; schedule restarts.')
 
         # FP16 GradScaler state (only relevant when training with fp16).
         if scaler is not None and checkpoint.get('scaler') is not None:
@@ -541,6 +589,26 @@ def main():
         if rank == 0:
             logger.info(f'Resumed at epoch {start_epoch}, '
                         f'LR {optimizer.param_groups[0]["lr"]:.6f}')
+        
+        if args.finetune_lr:
+            ratio = (backbone_lr / head_lr) if head_lr > 0 else 1.0
+            ft_head = args.finetune_lr
+            ft_backbone = ft_head * ratio
+            for i, pg in enumerate(optimizer.param_groups):
+                lr_i = ft_backbone if i == 0 else ft_head
+                pg['lr'] = lr_i
+                pg['initial_lr'] = lr_i
+            steps_per_epoch = config.NUM_IMAGE // (config.TRAIN.BATCH_SIZE * world_size)
+            remaining = max(1, (config.TRAIN.END_EPOCH - start_epoch) * steps_per_epoch)
+
+            def _finetune_cosine(step, total=remaining):
+                return 0.5 * (1.0 + math.cos(math.pi * min(1.0, step / total)))
+
+            lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _finetune_cosine)
+            scheduler_per_step = True
+            if rank == 0:
+                logger.info(f'Fine-tune LR: cosine head {ft_head:.2e}->0, backbone '
+                            f'{ft_backbone:.2e}->0 over {config.TRAIN.END_EPOCH - start_epoch} epochs')
 
     # ================================ DATA ================================
     train_transform = transforms.Compose([
@@ -618,11 +686,16 @@ def main():
         if not scheduler_per_step:
             lr_scheduler.step()
 
-        # --- Resumable checkpoint: EVERY rank saves its own shard ---
+        # --- Resumable checkpoint: EVERY rank saves AND uploads its OWN shard ---
         # PartialFC shards the classifier across GPUs, so each rank holds a
-        # different slice of the head + its optimizer state. The backbone is
-        # DDP-synced (identical everywhere) but included in each file so a rank
-        # can resume from its own checkpoint alone.
+        # different slice. Each rank handling only its own file lets the uploads
+        # run in parallel, so no rank waits on another's Azure I/O.
+
+        # Wait for THIS rank's previous background upload before overwriting its shard.
+        if use_azure:
+            _join_background_upload()
+
+        ckpt_path = os.path.join(final_output_dir, f'checkpoint_gpu_{rank}.pt')
         torch.save({
             'epoch': epoch + 1,
             'state_dict': model.module.state_dict(),
@@ -630,10 +703,7 @@ def main():
             'optimizer': optimizer.state_dict(),
             'state_lr_scheduler': lr_scheduler.state_dict(),
             'scaler': scaler.state_dict() if scaler is not None else None,
-        }, os.path.join(final_output_dir, f'checkpoint_gpu_{rank}.pt'))
-
-        # Ensure all ranks finished writing before rank 0 reads/uploads them.
-        dist.barrier()
+        }, ckpt_path)
 
         # --- Rank-0-only: metrics, eval backbone, logging, Azure uploads ---
         if rank == 0:
@@ -669,13 +739,25 @@ def main():
             epoch_path = os.path.join(final_output_dir, f'backbone_epoch_{epoch:03d}.pth.tar')
             torch.save({'epoch': epoch + 1, 'state_dict': model.module.state_dict()}, epoch_path)
 
-            # Upload this epoch's outputs to Azure (best-effort; never blocks training).
-            if use_azure:
-                _azure_upload(epoch_path, azure_remote_dir)
-                for r in range(world_size):
-                    _azure_upload(
-                        os.path.join(final_output_dir, f'checkpoint_gpu_{r}.pt'), azure_remote_dir)
-                _azure_upload(metrics_csv, azure_remote_dir)
+        # Every rank uploads its OWN shard in the background; rank 0 adds the
+        # backbone + metrics CSV. The big resumable shards upload only every
+        # CHECKPOINT_UPLOAD_FREQ epochs (and on the last one) to cut Azure traffic
+        # and boundary stalls — they are still SAVED locally every epoch for --resume.
+        if use_azure:
+            freq = config.get('CHECKPOINT_UPLOAD_FREQ', 1)
+            upload_ckpt = freq > 0 and ((epoch + 1) % freq == 0
+                                        or epoch + 1 == config.TRAIN.END_EPOCH)
+            my_files = []
+            if rank == 0:
+                my_files += [epoch_path, metrics_csv]
+            # NOTE: per-rank resumable shards (checkpoint_gpu_<rank>.pt) are NOT
+            # uploaded to Azure anymore — only the backbone .pth.tar + metrics CSV
+            # are. The shards are still SAVED locally every epoch for --resume.
+            # (Uploading the large shards was stalling ranks and NCCL-timing-out.)
+            # if upload_ckpt:
+            #     my_files.append(ckpt_path)
+            if my_files:
+                _start_background_upload(my_files, azure_remote_dir)
 
         dist.barrier()
 
@@ -683,8 +765,9 @@ def main():
         time_used = (time.time() - start) / 3600.0
         logger.info(f'Done Training. Consumed {time_used:.2f} hours')
 
-        # Upload training logs at the end (best-effort).
+        # Wait for the last epoch's background upload, then upload logs (best-effort).
         if use_azure:
+            _join_background_upload()
             import glob
             for log_file in glob.glob(os.path.join(final_output_dir, '*.log')):
                 _azure_upload(log_file, azure_remote_dir)
