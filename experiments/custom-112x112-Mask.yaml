@@ -1,51 +1,53 @@
 # Stage 3: Mask training (FPN mask prediction + feature masking)
-# Loads Stage 2 pretrained backbone, enables mask branch.
+# Loads Stage 2 (Occ) backbone, enables the mask branch.
 # This is the full FROM method with PartialFC.
 #
-# IMPORTANT: Update these before training:
-#   - DATASET.REC_PATH, NUM_CLASS, NUM_IMAGE
-#   - NETWORK.PRETRAINED: path to Stage 2 best model
+# IMPORTANT: after Stage 2 finishes, set NETWORK.PRETRAINED to the final/best
+# backbone_epoch_XXX.pth.tar from the Stage 2 output dir.
 
 NETWORK:
-  PRETRAINED: 'output/Custom/.../backbone_epoch_039.pth.tar'  # <-- CHANGE THIS: pick an epoch from Stage 2's output dir
+  # Stage 2 (Occ) best backbone — epoch 36 gave the best results.
+  PRETRAINED: 'output/Custom/iResNet50_FPN_CosFace-Occ/custom-112x112-Occ-pattern_5-weight_1-lr_0.1-optim_sgd-pretrained_1_factor_1/backbone_epoch_036.pth.tar'
   IMAGE_SIZE: [112, 112]
 
 DATASET:
-  REC_PATH: '/path/to/your/recordio/dataset'
-  NUM_CLASS: 100000
+  REC_PATH: '/training'
+  NUM_CLASS: 390570
   TRAIN_DATASET: 'Custom'
 
 LOSS:
   TYPE: 'CosFace'
-  WEIGHT_PRED: 1.0
+  WEIGHT_PRED: 1.0          # weight of the mask-prediction (grid) loss; raise to emphasize the mask branch
   SCALE: 64.0
   MARGIN: 0.4
   MARGIN_WARMUP_EPOCHS: 5
 
 TRAIN:
-  MODE: 'Mask'
+  MODE: 'Mask'              # <-- the key change: enables the FPN mask branch
   MODEL: 'iResNet50_FPN'
-  LR: 0.001
+  LR: 0.1                   # head (PartialFC) LR — fresh classifier
+  BACKBONE_LR: 0.001        # pretrained backbone + preserved fc embedding — gentle fine-tune (epoch-36 is your best)
+  MASK_LR: 0.1              # fresh FROM mask branch (fpn/mask/regress) — learns from scratch
   LR_STEP: [15, 30]
   LR_FACTOR: 0.1
   END_EPOCH: 40
-  BATCH_SIZE: 64
+  BATCH_SIZE: 256           # Mask forward is heavier (FPN + mask + 2x fc) — start lower, raise if VRAM allows
   OPTIMIZER: 'sgd'
   MOMENTUM: 0.9
   WD: 0.0005
   PATTERN: 5
   NUM_MASK: 226
-  RATIO: 3            # 1-in-3 images stay clean (Occ/Mask only)
   WORKERS: 8
   PRINT_FREQ: 100
 
-SAMPLE_RATE: 0.1
+SAMPLE_RATE: 0.4
 FP16: True
 LR_SCHEDULER: 'cosine'
-NUM_IMAGE: 5000000         # <-- CHANGE THIS
+NUM_IMAGE: 25342967
 
 # Azure File Share upload
 USE_AZURE: True
-AZURE_REMOTE_DIR: "training-checkpoint/from"
+AZURE_REMOTE_DIR: "training-checkpoint/x-flow/phase-3"
 WARMUP_ITERS: 2000
 WARMUP_LR: 0.0
+CHECKPOINT_UPLOAD_FREQ: 5

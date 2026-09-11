@@ -52,6 +52,7 @@ config.TRAIN.PRINT_FREQ = 100
 config.TRAIN.OPTIMIZER = 'sgd'          # 'sgd' | 'adam' | 'adamw'
 config.TRAIN.LR = 0.1                    # LR for the PartialFC head (and backbone if BACKBONE_LR=0)
 config.TRAIN.BACKBONE_LR = 0            # separate LR for the backbone; 0 = same as LR
+config.TRAIN.MASK_LR = 0               # >0 splits the fresh FROM mask branch (fpn/mask/regress/fc) into its own LR group (Phase 3)
 config.TRAIN.LR_FACTOR = 0.1
 config.TRAIN.LR_STEP = [15, 30]
 config.TRAIN.MOMENTUM = 0.9

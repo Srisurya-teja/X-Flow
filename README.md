@@ -19,7 +19,7 @@ FROM/
 ├── experiments/
 │   ├── custom-112x112-Clean.yaml       # Stage 1 config
 │   ├── custom-112x112-Occ.yaml         # Stage 2 config
-│   ├── custom-112x112-Mask.yaml        # Stage 3 config
+│   ├── custom-112x112-Mask.yaml        # Stage 3 config (3-group discriminative LR)
 │   └── smoke-test.yaml                 # fast validation config (--max_steps)
 ├── lib/
 │   ├── models/   fpn_112.py · iresnet_fpn.py · partial_fc_v2.py · margin_losses.py · lr_scheduler.py
@@ -88,8 +88,8 @@ bash start_distributed.sh 3   # Stage 3: full FROM mask training
 the previous stage's output dir (only the backbone transfers between stages — a
 fresh PartialFC head, optimizer, and LR schedule start each stage, so you may seed
 from **any** epoch, not just the last). Adjust `NUM_GPUS` / `BATCH_SIZE` at the top
-of `start_distributed.sh`. See **INTEGRATION_GUIDE.md** for the occlusion pipeline
-and stage details.
+of `start_distributed.sh`. See **INTEGRATION_GUIDE.md** for the occlusion pipeline,
+stage details, and the 3-group discriminative learning rate setup.
 
 ## Smoke test
 
@@ -114,14 +114,18 @@ Edit each `experiments/custom-112x112-*.yaml`:
 | `DATASET.REC_PATH` | dir with `train.rec` / `train.idx` (e.g. `/data/dataset`) |
 | `DATASET.NUM_CLASS` | number of identities |
 | `NUM_IMAGE` | total images (drives `cosine`/`polynomial` schedule length) |
-| `SAMPLE_RATE` | PartialFC negative sampling: `1.0` (<50K ids), `0.1` (100K+), `0.01` (1M+) |
+| `SAMPLE_RATE` | PartialFC negative sampling: `1.0` (<50K ids), `0.4` (100K–500K), `0.1` (500K+), `0.01` (1M+) |
 | `FP16` | mixed-precision training |
 | `LR_SCHEDULER` | `cosine` · `polynomial` · `multistep` |
 | `WARMUP_ITERS` / `WARMUP_LR` | linear LR warmup: steps and start LR |
 | `LOSS.TYPE` | `CosFace` · `ArcFace` · `Combined` |
 | `LOSS.SCALE` / `LOSS.MARGIN` | margin-softmax scale `s` and target margin `m` |
 | `LOSS.MARGIN_WARMUP_EPOCHS` | epochs to linearly ramp margin `0 → MARGIN` (`0` = off) |
-| `LOSS.WEIGHT_PRED` | weight of the mask-prediction loss (Stage 3 only) |
+| `LOSS.WEIGHT_PRED` | weight of the mask-prediction loss (Stage 3 only); raise to emphasize mask branch |
+| `TRAIN.LR` | PartialFC head LR (and backbone if `BACKBONE_LR` is 0) |
+| `TRAIN.BACKBONE_LR` | separate LR for the pretrained backbone; `0` = same as `LR` |
+| `TRAIN.MASK_LR` | **Stage 3 only** — when `> 0`, splits the freshly-initialized FROM mask branch (`fpn.*`, `mask.*`, `regress.*`) into its own LR group so it can learn at a high rate while the backbone fine-tunes gently |
+| `CHECKPOINT_UPLOAD_FREQ` | upload a checkpoint to Azure every N epochs (in addition to the final upload) |
 | `USE_AZURE` | upload checkpoints/logs to Azure File Share each epoch |
 | `AZURE_REMOTE_DIR` | remote base path on the share |
 
@@ -131,6 +135,24 @@ up over `WARMUP_ITERS`; `multistep` drops LR by `LR_FACTOR` at `LR_STEP` epochs.
 **Margin warmup:** with `MARGIN_WARMUP_EPOCHS: 5`, the margin ramps linearly from
 `0.0` to `LOSS.MARGIN` over the first 5 epochs, then holds — a gentler start than
 full margin from epoch 0.
+
+### Stage 3 Discriminative Learning Rates (3-Group Optimizer)
+
+Stage 3 (Mask mode) introduces a **three-group optimizer** to handle the fact that
+the backbone is pretrained while the FROM mask branch (`fpn`, `mask`, `regress`) is
+randomly initialized:
+
+| Group | Parameters | LR Key | Typical Value |
+|-------|-----------|--------|---------------|
+| 0 | Pretrained backbone + `fc` embedding | `BACKBONE_LR` | `0.001` |
+| 1 | Fresh mask branch (`fpn.*`, `mask.*`, `regress.*`) | `MASK_LR` | `0.1` |
+| 2 (last) | PartialFC head (new classifier) | `LR` | `0.1` |
+
+Set `MASK_LR: 0` (the default) to fall back to the 2-group mode used in Stages 1
+and 2. When `MASK_LR > 0`, the trainer logs:
+```
+3-group LR -> backbone=0.001, mask_branch=0.1, head=0.1
+```
 
 ## Outputs
 
@@ -150,7 +172,8 @@ training_metrics.csv                        # per-epoch: loss, cls, pred, lr, ti
   across GPUs, so **each rank saves its own shard** (+ optimizer, LR scheduler, FP16
   scaler). All shards are needed to resume.
 - If `USE_AZURE: True`, all of the above are uploaded (best-effort, never blocking)
-  to `training-checkpoint/from/<run_name>/`; the log is uploaded at the end of the run.
+  to the path set in `AZURE_REMOTE_DIR`; checkpoints are also uploaded every
+  `CHECKPOINT_UPLOAD_FREQ` epochs (default: every epoch if not set).
 
 ## Resume
 

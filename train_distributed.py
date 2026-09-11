@@ -406,7 +406,6 @@ def main():
     }[config.TRAIN.MODEL]
 
     # Load pretrained backbone (optional)
-    # Load pretrained backbone (optional)
     if config.NETWORK.PRETRAINED and config.NETWORK.PRETRAINED != '':
         pretrained_path = config.NETWORK.PRETRAINED
         if os.path.isfile(pretrained_path):
@@ -475,17 +474,40 @@ def main():
     criterion_mask_pred = nn.CrossEntropyLoss().cuda()
 
     # ================================ OPTIMIZER ================================
-    # Discriminative learning rates: a low LR for the (pretrained) backbone and a
-    # high LR for the freshly-initialized PartialFC head. Set BACKBONE_LR to 0 to
-    # use a single LR (config.TRAIN.LR) for both. param_groups[0]=backbone, [1]=head.
+    # Discriminative learning rates. Two modes:
+    #   - 2 groups (default): [0]=backbone (BACKBONE_LR), [-1]=PartialFC head (LR).
+    #   - 3 groups (Phase 3): set MASK_LR>0 to split the FRESH FROM mask branch
+    #     (fpn/mask/regress/fc) out of the backbone so it can learn at a high LR
+    #     while the pretrained backbone fine-tunes gently. Order stays
+    #     [0]=backbone, [1]=mask_branch, [-1]=head, so all existing [0]/[-1] refs hold.
     head_lr = config.TRAIN.LR
     backbone_lr = config.TRAIN.get('BACKBONE_LR', 0) or head_lr
-    opt_params = [
-        {'params': model.parameters(), 'lr': backbone_lr},
-        {'params': module_pfc.parameters(), 'lr': head_lr},
-    ]
-    if rank == 0 and backbone_lr != head_lr:
-        logger.info(f'Discriminative LR -> backbone={backbone_lr}, head={head_lr}')
+    mask_lr = config.TRAIN.get('MASK_LR', 0)
+
+    if mask_lr:
+        # The FROM mask branch (fpn/mask/regress) is randomly initialized in Mask
+        # mode; give it its own high LR group. NOTE: keep this list in sync with the
+        # loader's skip_prefixes — anything LOADED from the pretrained checkpoint
+        # (backbone + fc) belongs in the low-LR backbone group, not here.
+        mask_prefixes = ('fpn.', 'mask.', 'regress.')
+        backbone_params, mask_params = [], []
+        for name, p in model.module.named_parameters():
+            (mask_params if name.startswith(mask_prefixes) else backbone_params).append(p)
+        opt_params = [
+            {'params': backbone_params, 'lr': backbone_lr},
+            {'params': mask_params, 'lr': mask_lr},
+            {'params': module_pfc.parameters(), 'lr': head_lr},
+        ]
+        if rank == 0:
+            logger.info(f'3-group LR -> backbone={backbone_lr}, '
+                        f'mask_branch={mask_lr}, head={head_lr}')
+    else:
+        opt_params = [
+            {'params': model.parameters(), 'lr': backbone_lr},
+            {'params': module_pfc.parameters(), 'lr': head_lr},
+        ]
+        if rank == 0 and backbone_lr != head_lr:
+            logger.info(f'Discriminative LR -> backbone={backbone_lr}, head={head_lr}')
 
     if config.TRAIN.OPTIMIZER == 'sgd':
         optimizer = torch.optim.SGD(

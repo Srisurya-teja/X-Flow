@@ -123,7 +123,7 @@ class MXFaceDataset_Occ(Dataset):
             try:
                 s = self.imgrec.read_idx(idx)
                 header, img_bytes = mx.recordio.unpack(s)
-                img = mx.image.imdecode(img_bytes).asnumpy()  # BGR numpy array
+                img = mx.image.imdecode(img_bytes).asnumpy()  
                 break
             except Exception as e:
                 if retry == 4:
@@ -131,7 +131,6 @@ class MXFaceDataset_Occ(Dataset):
                     return self.__getitem__(random.randint(0, len(self) - 1))
                 continue
 
-        # Convert BGR -> RGB -> PIL
         img = Image.fromarray(img[:, :, ::-1])
 
         # Resize to target size if needed
